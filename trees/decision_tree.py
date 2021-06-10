@@ -1,12 +1,22 @@
-from sklearn.datasets import make_moons
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
 import numpy as np
 
-def gini_impurity(buckets):
-    total = buckets.sum()
+def entropy(buckets, total = None):
+    if total is None: total = buckets.sum()
+    if total == 0: return 1
+    probs = buckets / total
+    probs *= np.log2(probs, out = np.zeros_like(probs), where=(probs != 0))
+    return -probs.sum()
+
+def gini(buckets, total = None):
+    if total is None: total = buckets.sum()
     if total == 0: return 1
     return 1 - np.square(buckets / total).sum()
+
+CRITERIA_FUNCS = {'gini': gini, 'entropy': entropy }
+
+class InvalidArgError(Exception):
+    def __init__(self, msg):
+        super.__init__(msg)
 
 class NotFittedError(Exception):
     def __init__(self, msg):
@@ -14,137 +24,141 @@ class NotFittedError(Exception):
     
 class DecisionTree:
     class Node:
-        def __init__(self, X, y, buckets, gini):
+        def __init__(self, X, y, buckets, predicted_class, n_samples, impurity):
             self.X = X
             self.y = y
-            self.buckets = buckets # 1-dimensional np.ndarray with #num_classes counts for each class
-            self.n_samples = np.sum(self.buckets) 
-            self.gini = gini
+            self.buckets = buckets # 1-dimensional np.ndarray with #n_classes counts for each class
+            self.predicted_class = predicted_class
+            self.n_samples = n_samples
+            self.impurity = impurity
+            self.feature_index = -1
+            self.thres = -1
             self.left = None
             self.right = None
-            self.feature_index = None
-            self.thres = None
-
-        @property
-        def proba_(self):
-            '''
-                Returns the class probabilities for this node
-            '''
-            return self.buckets / self.n_samples
-
-        def is_leaf(self):
-            return self.left == None and self.right == None
+        
+        def debug(self, tabs=0):
+            if self.left: print('  '*tabs, 'Inner[index=', self.feature_index, ', thres=', self.thres, ', n_samples=', self.n_samples, ']')
+            else: print('  '*tabs, 'Leaf[n_samples=', self.n_samples, ']')
+            if self.left:
+                self.left.debug(tabs+1)
+                self.right.debug(tabs+1)
 
 
-    def __init__(self, max_depth):
-        # self.criterion = criterion
-        # self.splitter = splitter
+    def __init__(self, criterion = "gini", max_depth = None, min_samples_split = 2, min_impurity_decrease = 0.0):
+        self.n_leaf_nodes = 0
+        self.criterion = criterion
+
+        if max_depth is not None and max_depth <= 0:
+            raise InvalidArgError("max_depth must be a positive integer.")
         self.max_depth = max_depth
-        self.prev_gini_cost = np.inf
+
+        if min_samples_split < 2: 
+            raise InvalidArgError("min_samples_split must be at least 2.")
+        self.min_samples_split = min_samples_split
+
+        if min_impurity_decrease < 0.0:
+            raise InvalidArgError("min_impurity_decrease must be positive.")
+        self.min_impurity_decrease = min_impurity_decrease
+
 
     def fit(self, X, y):
-        self.num_classes = len(np.unique(y))
-        root_buckets = self.make_buckets(y)
-        root_gini = gini_impurity(root_buckets)
-        root = self.Node(X, y, root_buckets, root_gini)
-        self.tree = self.make_tree(root, 0)
+        self.criterion = CRITERIA_FUNCS[self.criterion];
+        self.n_samples = len(X)
+        self.n_classes = len(np.unique(y))
+
+        if isinstance(self.min_samples_split, float):
+            self.min_samples_split = self.min_samples_split * self.n_samples
+
+        self.tree_ = self._make_tree(X, y, 0)
 
     def predict(self, X):
-        if self.tree is None: 
+        if self.tree_ is None: 
             raise NotFittedError("Model not fitted yet. Call'fit' on the data before invoking 'predict'")
         
         n_samples = X.shape[0]
         preds = np.zeros((n_samples, 1))
         for i in range(n_samples):
-            cur_node = self.tree
-            while not cur_node.is_leaf():
+            cur_node = self.tree_
+            while cur_node.left:
                 if X[i, cur_node.feature_index] < cur_node.thres:
                     cur_node = cur_node.left
                 else:
                     cur_node = cur_node.right
-            preds[i] = np.argmax(cur_node.proba_)
+            preds[i] = cur_node.predicted_class
         return preds
+    
+    def debug(self):
+        if self.tree_ is None: 
+            raise NotFittedError("Model not fitted yet. Call'fit' on the data before invoking 'predict'")
+        self.tree_.debug()
 
-    def make_tree(self, root, depth):
+    def _make_tree(self, X, y, depth):
         '''
-            Constructs decision tree recursively and stores it in self.tree
+            Constructs decision tree recursively and stores it in self.tree_
         '''
-        if root is None:
-            return root
-        if depth == self.max_depth:
-            return root
+        buckets = np.array([np.sum(y == i) for i in range(self.n_classes)])
+        impurity = self.criterion(buckets)
+        root = self.Node(X, y, buckets, np.argmax(buckets), y.size, impurity)
 
-        l_node, r_node = self.split_least_gini(root)
-        root.left = self.make_tree(l_node, depth + 1)
-        root.right = self.make_tree(r_node, depth + 1)
+        if self.max_depth and depth < self.max_depth:
+            idx, threshold  = self._split_least_impure(root)
+            if idx is not None:
+                root.thres = threshold
+                root.feature_index = idx
+                mask = X[:, idx] < threshold
+                X_left, X_right, y_left, y_right = X[mask], X[~mask], y[mask], y[~mask]
+                root.left = self._make_tree(X_left, y_left, depth + 1)
+                root.right = self._make_tree(X_right, y_right, depth + 1)
+
+
         return root
 
-    def make_buckets(self, arr):
+    def _split_least_impure(self, root):
         '''
-            Takes an np.ndarray and turns it into discrete buckets with no.of occurrences of each class in each one
-        '''
-        _, counts = np.unique(arr, return_counts = True)
-        buckets = np.resize(counts, self.num_classes)
-        return buckets
-
-    def split_least_gini(self, root):
-        '''
-            Splits x and y into 2 subsets each such that the sum of the Gini impurity of the left and right subsets is minimised,
-            and returns the tuple containing instances of the Node class for the left and right subsets respectively.
+            Splits x and y into 2 subsets each such that the sum of the impurities of the left and right subsets is minimised
+            Returns tuple containing the index of the feature and threhsold to be used for partitioning
         '''
         X, y = root.X, root.y
         m,n = X.shape
-        best_gini = np.inf
-        best_thres = -1
-        best_fi = -1
-        best_left_bucket, best_right_bucket = None, None
 
-        for feature_index in range(n):
-            X_sorted_tuple, y_sorted_tuple = zip(*sorted(zip(X[:, feature_index], y))) # m log m (times n for each feature_index)
-            X_sorted, y_sorted= np.array(X_sorted_tuple), np.array(y_sorted_tuple)
-            m_left = -1
-            for i, threshold in enumerate(X_sorted):
-                if i == 0:
-                    # we have not initialised them yet
-                    mask = X_sorted < threshold
-                    y_left = y_sorted[mask]
-                    m_left = len(y_left)
-                    left_bucket = self.make_buckets(y_left)
-                    y_right = y_sorted[~mask]
-                    right_bucket = self.make_buckets(y_right)
-                else:
-                    # do incremental updates 
-                    if threshold == X_sorted[i-1]:
-                        continue
-                    previous_class = y_sorted[i-1]
-                    left_bucket[previous_class] += 1
-                    right_bucket[previous_class] -= 1
-                    m_left += 1
+        if m <= 1 or m < self.min_samples_split:
+            return None, None
 
-                gini_l = gini_impurity(left_bucket)
-                gini_r = gini_impurity(right_bucket)
-                gini_cost = (m_left / m)  * gini_l + ((m-m_left)/m) * gini_r
+        counts = root.buckets
+        lowest_impurity = root.impurity
+        lowest_left_impurity, lowest_right_impurity = None, None
+        n_left = 0
+        n_right = m
+        best_thres, best_fi = None, None
 
-                if gini_cost < best_gini:
-                    best_gini_cost, best_gini_l, best_gini_r = gini_cost, gini_l, gini_r
-                    best_thres = threshold
-                    best_fi = feature_index
-                    best_left_bucket = left_bucket
-                    best_right_bucket = right_bucket
+        for idx in range(n):
+            thresholds, classes = zip(*sorted(zip(X[:, idx], y))) # m log m (times n for each feature_index)
+            left_bucket = np.zeros(self.n_classes)
+            right_bucket = counts.copy()
 
-        # First check if we have an improvement in cost from parent
-        if best_gini_cost >= self.prev_gini_cost:
-            return None, None;
+            for i in range(1,m):
+                prev_c = classes[i-1]
+                left_bucket[prev_c] += 1
+                right_bucket[prev_c] -= 1
 
-        # Set new gini cost
-        self.prev_gini_cost = best_gini_cost
+                if thresholds[i] == thresholds[i-1]:
+                    continue
 
-        # Found the best values for the root
-        root.feature_index = best_fi
-        root.thres = best_thres
+                left_impurity = self.criterion(left_bucket, i)
+                right_impurity = self.criterion(right_bucket, m-i)
+                impurity = (i*left_impurity + (m-i)*right_impurity)/m
 
-        # Now return the child nodes
-        best_mask = X[:, best_fi] < best_thres
-        return self.Node(X[best_mask], y[best_mask], best_left_bucket, best_gini_l), \
-               self.Node(X[~best_mask], y[~best_mask], best_right_bucket, best_gini_r)
+                if impurity < lowest_impurity:
+                    lowest_impurity, lowest_left_impurity, lowest_right_impurity = impurity, left_impurity, right_impurity
+                    n_left = i
+                    n_right = m-i
+                    best_fi = idx
+                    best_thres = (thresholds[i] + thresholds[i-1]) / 2
+
+        if best_fi is not None and self.min_impurity_decrease > 0.0:
+            weighted_imp_dec = (m / self.n_samples) * (root.impurity - (n_left / m * lowest_left_impurity) - (n_right / m * lowest_right_impurity))
+            if weighted_imp_dec < self.min_impurity_decrease:
+                return None, None # Don't split if improvement is below threshold
+
+        return (best_fi, best_thres)
 
