@@ -1,3 +1,4 @@
+from utils.exceptions import NotFittedError, InvalidArgError
 import numpy as np
 
 def entropy(buckets, total = None):
@@ -14,15 +15,11 @@ def gini(buckets, total = None):
 
 CRITERIA_FUNCS = {'gini': gini, 'entropy': entropy }
 
-class InvalidArgError(Exception):
-    def __init__(self, msg):
-        super.__init__(msg)
-
-class NotFittedError(Exception):
-    def __init__(self, msg):
-        super.__init__(msg)
-    
 class DecisionTree:
+    '''
+        DISCLAIMER: Not very optimised, fast implementation would likely be in CPython
+    '''
+
     class Node:
         def __init__(self, X, y, buckets, predicted_class, n_samples, impurity):
             self.X = X
@@ -61,22 +58,31 @@ class DecisionTree:
         self.min_impurity_decrease = min_impurity_decrease
 
 
-    def fit(self, X, y):
+    def fit(self, X, y, sample_weight = None):
         self.criterion = CRITERIA_FUNCS[self.criterion];
-        self.n_samples = len(X)
+
+        if sample_weight is None:
+            self.weighted_n_samples = len(X)
+        elif isinstance(sample_weight, np.ndarray):
+            self.weighted_n_samples = sample_weight.sum()
+        else:
+            raise InvalidArgError("Expect numpy array for sample_weight")
+
         self.n_classes = len(np.unique(y))
+        self.sample_weight = sample_weight
+        self.samples = X
 
         if isinstance(self.min_samples_split, float):
             self.min_samples_split = self.min_samples_split * self.n_samples
 
-        self.tree_ = self._make_tree(X, y, 0)
+        self.tree_ = self._make_tree(X, y, 0, np.arange(X.shape[0]))
 
     def predict(self, X):
         if self.tree_ is None: 
             raise NotFittedError("Model not fitted yet. Call'fit' on the data before invoking 'predict'")
         
         n_samples = X.shape[0]
-        preds = np.zeros((n_samples, 1))
+        preds = np.zeros((n_samples, ), dtype=int)
         for i in range(n_samples):
             cur_node = self.tree_
             while cur_node.left:
@@ -89,31 +95,38 @@ class DecisionTree:
     
     def debug(self):
         if self.tree_ is None: 
-            raise NotFittedError("Model not fitted yet. Call'fit' on the data before invoking 'predict'")
+            raise NotFittedError("Estimator not fitted yet. Call'fit' on the data before invoking 'predict'")
         self.tree_.debug()
 
-    def _make_tree(self, X, y, depth):
+    def _make_tree(self, X, y, depth, indices):
         '''
             Constructs decision tree recursively and stores it in self.tree_
         '''
-        buckets = np.array([np.sum(y == i) for i in range(self.n_classes)])
+        buckets = np.zeros(self.n_classes)
+        for i in range(self.n_classes):
+            if self.sample_weight is not None:
+                buckets[i] = np.sum(self.sample_weight[np.nonzero(y == i)])
+            else:
+                buckets[i] = np.sum(y==i)
+
         impurity = self.criterion(buckets)
         root = self.Node(X, y, buckets, np.argmax(buckets), y.size, impurity)
 
         if self.max_depth and depth < self.max_depth:
-            idx, threshold  = self._split_least_impure(root)
+            idx, threshold = self._split_least_impure(root, indices)
             if idx is not None:
                 root.thres = threshold
                 root.feature_index = idx
                 mask = X[:, idx] < threshold
                 X_left, X_right, y_left, y_right = X[mask], X[~mask], y[mask], y[~mask]
-                root.left = self._make_tree(X_left, y_left, depth + 1)
-                root.right = self._make_tree(X_right, y_right, depth + 1)
-
+                left_indices = indices[mask]
+                right_indices = indices[~mask]
+                root.left = self._make_tree(X_left, y_left, depth + 1, left_indices)
+                root.right = self._make_tree(X_right, y_right, depth + 1, right_indices)
 
         return root
 
-    def _split_least_impure(self, root):
+    def _split_least_impure(self, root, indices):
         '''
             Splits x and y into 2 subsets each such that the sum of the impurities of the left and right subsets is minimised
             Returns tuple containing the index of the feature and threhsold to be used for partitioning
@@ -123,40 +136,54 @@ class DecisionTree:
 
         if m <= 1 or m < self.min_samples_split:
             return None, None
+           
+        self.weighted_n_current = m
+        if self.sample_weight is not None:
+            self.weighted_n_current = (np.take(self.sample_weight, indices)).sum()
 
         counts = root.buckets
         lowest_impurity = root.impurity
         lowest_left_impurity, lowest_right_impurity = None, None
-        n_left = 0
-        n_right = m
         best_thres, best_fi = None, None
+        w = 1.0
 
         for idx in range(n):
             thresholds, classes = zip(*sorted(zip(X[:, idx], y))) # m log m (times n for each feature_index)
             left_bucket = np.zeros(self.n_classes)
             right_bucket = counts.copy()
+            weighted_n_left = 0
 
             for i in range(1,m):
+                if self.sample_weight is not None:
+                    w = self.sample_weight[indices[i]]
+
                 prev_c = classes[i-1]
-                left_bucket[prev_c] += 1
-                right_bucket[prev_c] -= 1
+                left_bucket[prev_c] += w
+                right_bucket[prev_c] -= w
 
                 if thresholds[i] == thresholds[i-1]:
                     continue
 
-                left_impurity = self.criterion(left_bucket, i)
-                right_impurity = self.criterion(right_bucket, m-i)
-                impurity = (i*left_impurity + (m-i)*right_impurity)/m
+                weighted_n_left += w
+                weighted_n_right = self.weighted_n_current - weighted_n_left
+                left_impurity = self.criterion(left_bucket, weighted_n_left)
+                right_impurity = self.criterion(right_bucket, weighted_n_right)
+
+                impurity = (weighted_n_left * left_impurity + weighted_n_right * right_impurity) / self.weighted_n_current
 
                 if impurity < lowest_impurity:
                     lowest_impurity, lowest_left_impurity, lowest_right_impurity = impurity, left_impurity, right_impurity
-                    n_left = i
-                    n_right = m-i
+                    best_n_left = weighted_n_left 
                     best_fi = idx
                     best_thres = (thresholds[i] + thresholds[i-1]) / 2
 
+
         if best_fi is not None and self.min_impurity_decrease > 0.0:
-            weighted_imp_dec = (m / self.n_samples) * (root.impurity - (n_left / m * lowest_left_impurity) - (n_right / m * lowest_right_impurity))
+            best_n_right = self.weighted_n_current - best_n_left
+            weighted_imp_dec = (self.weighted_n_current / self.weighted_n_samples) *  \
+                               (root.impurity - (best_n_left / self.weighted_n_current * lowest_left_impurity) - \
+                               (best_n_right / self.weighted_n_current * lowest_right_impurity))
+
             if weighted_imp_dec < self.min_impurity_decrease:
                 return None, None # Don't split if improvement is below threshold
 
