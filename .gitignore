@@ -130,3 +130,6 @@ dmypy.json
 
 # virtual env 
 ml-env
+
+# ignore data folder for deep learning
+/deep-learning/data
