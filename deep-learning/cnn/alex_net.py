@@ -105,30 +105,31 @@ def sum_correct(pred, target):
     return (torch.argmax(pred, dim=1) == target).float().sum()
 
 
-def train_minibatch(model, dl, loss_fn, opt):
+def train_minibatch(model, dl, loss_fn, opt, device):
     model.train()
     size = len(dl.dataset)
     train_loss = 0
     n_correct = 0
 
-    for Xb, yb in dl:
+    for batch, (Xb, yb) in enumerate(dl):
+        Xb, yb = Xb.to(device), yb.to(device)
         out = model(Xb)
         loss = loss_fn(out, yb)
-        train_loss += loss.item()
-        n_correct += sum_correct(out, yb)
-
+       
         opt.zero_grad()
         loss.backward()
         opt.step()
-
-    train_loss /= len(dl)
+        
+        train_loss += loss.item() * Xb.shape[0]
+        n_correct += sum_correct(out, yb).item()
+        
+    train_loss /= size
     train_accuracy = n_correct / size
     
-    print(f"{size}/{size}")
     print(f"loss: {train_loss:>0.3f} \t accuracy: {train_accuracy:>0.3f}")
 
 
-def validate_minibatch(model, dl, loss_fn):
+def validate_minibatch(model, dl, loss_fn, device):
     model.eval()
     size = len(dl.dataset)
     n_correct = 0
@@ -136,21 +137,22 @@ def validate_minibatch(model, dl, loss_fn):
 
     with torch.no_grad():
         for Xb, yb in dl:
+            Xb, yb = Xb.to(device), yb.to(device)
             out = model(Xb)
             valid_loss += loss_fn(out, yb).item()
-            n_correct += sum_correct(out, yb)
+            n_correct += sum_correct(out, yb).item()
 
-    valid_loss /= len(dl) 
+    valid_loss /= size
     valid_accuracy = n_correct / size
 
     print(f"valid_loss: {valid_loss:>0.3f} \t valid_accuracy: {valid_accuracy:>0.3f}")
 
 
 
-def predict(url, model, categories, transform):
+def predict(url, model, categories, transform, device):
     new_image = Image.open(requests.get(url, stream=True).raw).convert('RGB')
-    new_image = transform(new_image)
-    assert new_image.shape == (1,3,224,224)
+    new_image = transform(new_image).to(device)
+    new_image = new_image.reshape(1, 3, 227, 227)
 
     out = model(new_image)
 
@@ -225,28 +227,32 @@ if __name__ == "__main__":
 
     for epoch in range(n_epochs):
         print(f"Epoch {epoch} / {n_epochs}")
-        train_minibatch(model, train_dl, loss_fn, opt)
-        validate_minibatch(model, val_dl, loss_fn)
-
-
-    # Save model
-    PATH = os.path.join('..', 'models', '_alexnet_0.pth')
-    torch.save(model.state_dict(), PATH)
-
+        train_minibatch(model, train_dl, loss_fn, opt, device)
+        validate_minibatch(model, val_dl, loss_fn, device)
 
     # Test final accuracy
     model.eval()
+    model.to(device)
     with torch.no_grad():
-        accs = [(torch.argmax(model(Xb), dim=1) == yb).mean() for Xb, yb in test_dl]
-        test_accuracy = torch.stack(accs).float().mean()
-        print(f"Test accuracy: {test_accuracy:>0.3f}")
+            accs = [(torch.argmax(model(Xb.to(device)), dim=1) == yb.to(device)).float().mean() 
+                    for Xb, yb in test_dl]
+            test_accuracy = torch.stack(accs).float().mean()
+            print(f"Test accuracy: {test_accuracy:>0.3f}")
 
+            
+    # Save model
+    MODELS_PATH = os.path.join('..', 'models')
+    os.makedirs(MODELS_PATH, exist_ok=True)
     
+    SAVE_PATH = os.path.join(MODELS_PATH, '_alexnet_0.pth')
+    torch.save(model.state_dict(), SAVE_PATH)
+
     # Make new prediction
-    model = torch.load(PATH)
+    model.load_state_dict(torch.load(SAVE_PATH))
     model.eval()
+    
     new_image_url = 'https://anthropocenemagazine.org/wp-content/uploads/2020/04/Panda-2.jpg'
-    proba, label = predict(new_image_url, model, dataset.categories, transform=data_transforms['valid'])
+    proba, label = predict(new_image_url, model, dataset.categories, data_transforms['valid'], device)
     print(f"The prediction is {label} with a probability of {proba}") # should be panda
 
 
