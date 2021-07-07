@@ -23,7 +23,7 @@ class Discriminator(nn.Module):
                 self.conv_block(128, 256, 4, 2, 1),            # 256 x 16 x 16
                 self.conv_block(256, 512, 4, 2, 1),            # 512 x 8 x 8
                 self.conv_block(512, 1024, 4, 2, 1),           # 1024 x 4 x 4
-                self.conv_block(1024, 1, 4, 2, 0),             # 1 x 1 x 1
+                nn.Conv2d(1024, 1, 4, 2, 0),                   # 1 x 1 x 1
                 nn.Sigmoid()
         )
 
@@ -38,7 +38,7 @@ class Discriminator(nn.Module):
                 bias = False
             ),
             nn.BatchNorm2d(out_channels),
-            nn.LeakyReLU(0.2)
+            nn.LeakyReLU(0.2, inplace=True)
             )
 
     def forward(self, x):
@@ -71,7 +71,7 @@ class Generator(nn.Module):
                 bias = False
             ),
             nn.BatchNorm2d(out_channels),
-            nn.ReLU()
+            nn.ReLU(inplace=True)
             )
     
     def forward(self, x):
@@ -81,7 +81,11 @@ class Generator(nn.Module):
 
 def init_weights(module):
     if module.type in (nn.Conv2d, nn.BatchNorm2d, nn.ConvTranspose2d):
-        nn.init.normal_(module.weight, 0, 0.02)
+        nn.init.normal_(module.weight.data, 0, 0.02)
+    elif module.type == nn.BatchNorm2d:
+        nn.init.normal_(module.weight.data, 1.0, 0.02)
+        nn.init.constant_(module.bias.data, 0)
+
 
 if __name__ == '__main__':
     # train DCGAN
@@ -110,8 +114,15 @@ if __name__ == '__main__':
             ] 
     )
 
-    root =  os.path.join('..', 'dataset')
-    ds = datasets.CelebA(root, split='train', transform=transforms, download=True)
+    script_dir = os.path.dirname(__file__) # directory that this script is located at
+    root = os.path.join(script_dir, '../data', 'faces') # assumes deep-learning/data/faces direcotry contains data
+    
+    ds = datasets.ImageFolder(root, transform = transforms)
+    
+    # Uncomment below 2 lines to train DCGAN on CelebA dataset
+    # root =  os.path.join('..', 'dataset')
+    # ds = datasets.CelebA(root, split='train', transform=transforms, download=True)
+
     dl = DataLoader(ds, shuffle=True, batch_size=batch_size)
 
     opt_disc = optim.Adam(disc.parameters(), lr=lr, betas=betas)
@@ -119,23 +130,28 @@ if __name__ == '__main__':
 
     criterion = nn.BCELoss()
 
-    writer_fake = SummaryWriter(os.path.join('..', 'runs/DCGAN/fake'))
-    writer_real = SummaryWriter(os.path.join('..', 'runs/DCGAN/real'))
+    writer_fake = SummaryWriter(os.path.join(script_dir, '../runs/DCGAN/fake'))
+    writer_real = SummaryWriter(os.path.join(script_dir, '../runs/DCGAN/real'))
 
     step = 0
 
     for epoch in range(n_epochs):
       for batch_idx, (real, _) in enumerate(dl):
         real = real.to(device)
-        batch_size = real.shape[0]
 
         # train discriminator
         noise = torch.randn((batch_size, z_dim, 1, 1)).to(device)
         fake = gen(noise) # batch_size x img_channels x 64 x 64
-        fake_and_real = torch.cat([real, fake.detach()])
-        disc_y = torch.cat([torch.ones(batch_size), torch.zeros(batch_size)]).to(device)
-        disc_pred = disc(fake_and_real).view(-1) # batch_size
-        loss_disc = criterion(disc_pred, disc_y)
+        # Combining real and fake data will make BatchNorm not work (see https://github.com/soumith/ganhacks/issues/52)
+        # fake_and_real = torch.cat([real, fake.detach()]) 
+
+        disc_pred_real = disc(real).view(-1) # batch_size
+        loss_real = criterion(disc_pred_real, torch.ones_like(disc_pred_real))
+
+        disc_pred_fake = disc(fake.detach()).view(-1) # batch_size
+        loss_fake = criterion(disc_pred_fake, torch.zeros_like(disc_pred_fake))
+
+        loss_disc = (loss_real + loss_fake) / 2
 
         disc.zero_grad()
         loss_disc.backward()
@@ -165,4 +181,5 @@ if __name__ == '__main__':
             writer_real.add_image('Real', img_grid_real, global_step = step)
 
             step += 1
+
 
